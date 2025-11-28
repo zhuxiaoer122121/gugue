@@ -72,12 +72,9 @@ export const CalendarComposer: React.FC = () => {
   const bgImageRef = useRef<HTMLImageElement | null>(null);
   const fgImageRef = useRef<HTMLImageElement | null>(null);
 
-  // --- Handlers ---
+  // --- Logic Helpers ---
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>, type: 'bg' | 'fg') => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
+  const processFile = useCallback((file: File, type: 'bg' | 'fg') => {
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.src = url;
@@ -93,8 +90,9 @@ export const CalendarComposer: React.FC = () => {
         fgImageRef.current = img;
         
         // Initialize corners to be centered with reasonable size
-        const canvasW = canvasSize.width || 800;
-        const canvasH = canvasSize.height || 600;
+        // Use current canvas dimensions (or image dimensions if canvas not set yet)
+        const canvasW = canvasRef.current?.width || 800;
+        const canvasH = canvasRef.current?.height || 600;
         
         // Start with 50% of canvas width, maintaining aspect ratio
         const targetW = canvasW * 0.5;
@@ -119,7 +117,41 @@ export const CalendarComposer: React.FC = () => {
         setEditMode(EditMode.WARP);
       }
     };
+  }, [canvasSize]);
+
+  // --- Handlers ---
+
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>, type: 'bg' | 'fg') => {
+    const file = e.target.files?.[0];
+    if (file) processFile(file, type);
   };
+
+  // Paste Listener
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf('image') !== -1) {
+          const file = items[i].getAsFile();
+          if (file) {
+            // Smart decision: if BG missing, paste to BG. Else paste to FG.
+            if (!bgImageRef.current) {
+               processFile(file, 'bg');
+            } else {
+               processFile(file, 'fg');
+            }
+          }
+          break; // Only paste the first image found
+        }
+      }
+    };
+
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [processFile]);
+
 
   const addMask = () => {
     // Scale default size based on image dimensions
@@ -180,11 +212,12 @@ export const CalendarComposer: React.FC = () => {
   ) => {
     ctx.save();
     
-    // Seam Fix: Expand vertices slightly from centroid for clipping path
-    // Increased expansion to 1.5 to aggressively fill anti-aliasing gaps
+    // Seam Fix: Expand vertices slightly from centroid to cover gaps
+    // Expansion amount needs to be enough to cover anti-aliasing pixels but small enough to not distort too much
     const cx = (dx0 + dx1 + dx2) / 3;
     const cy = (dy0 + dy1 + dy2) / 3;
-    const expansion = 1.5; // Increased pixel amount to expand
+    // 1.0px expansion is usually safe to kill grid lines
+    const expansion = 1.0; 
     
     const expand = (x: number, y: number) => {
       const dirX = x - cx;
@@ -203,6 +236,8 @@ export const CalendarComposer: React.FC = () => {
     ctx.lineTo(p1.x, p1.y);
     ctx.lineTo(p2.x, p2.y);
     ctx.closePath();
+    
+    // We do NOT clip here anymore for the global shape, just for the texture mapping
     ctx.clip();
 
     // Compute affine transform using ORIGINAL destination coordinates
@@ -247,6 +282,8 @@ export const CalendarComposer: React.FC = () => {
       ctx.fillStyle = '#9ca3af';
       ctx.textAlign = 'center';
       ctx.fillText('Upload Template (Fig 1)', canvas.width / 2, canvas.height / 2);
+      ctx.font = '14px sans-serif';
+      ctx.fillText('(Or Paste Ctrl+V)', canvas.width / 2, canvas.height / 2 + 30);
     }
 
     // 2. Prepare Foreground on OFFSCREEN canvas
@@ -263,8 +300,12 @@ export const CalendarComposer: React.FC = () => {
       offCtx.imageSmoothingEnabled = true;
       offCtx.imageSmoothingQuality = 'high';
 
-      // Reduced subdivisions to 10 to minimize internal edges while maintaining good perspective
-      const subdivisions = 10; 
+      // NOTE: We REMOVED the initial clip() here because it causes aliased edges.
+      // Instead, we will draw the mesh slightly expanded (to hide grid lines), 
+      // and then use destination-in to cut the edges smoothly at the end.
+
+      // Draw mesh
+      const subdivisions = 20; // High resolution for smooth warp
       for (let i = 0; i < subdivisions; i++) {
         for (let j = 0; j < subdivisions; j++) {
           const u0 = i / subdivisions;
@@ -297,6 +338,22 @@ export const CalendarComposer: React.FC = () => {
           );
         }
       }
+
+      // --- SMOOTH EDGE CUTTING ---
+      // Apply the final shape mask using 'destination-in'.
+      // This preserves the smooth anti-aliased edge of the shape, cutting off any jagged triangle expansions.
+      offCtx.globalCompositeOperation = 'destination-in';
+      offCtx.beginPath();
+      offCtx.moveTo(tl.x, tl.y);
+      offCtx.lineTo(tr.x, tr.y);
+      offCtx.lineTo(br.x, br.y);
+      offCtx.lineTo(bl.x, bl.y);
+      offCtx.closePath();
+      offCtx.fillStyle = 'black'; // Color is irrelevant, alpha matters (1.0 keeps content)
+      offCtx.fill();
+      
+      // Reset composite mode
+      offCtx.globalCompositeOperation = 'source-over';
 
       // 2b. Apply Masks (Eraser) - NOW USING CAPSULE/PILL SHAPE
       offCtx.globalCompositeOperation = 'destination-out';
@@ -405,6 +462,23 @@ export const CalendarComposer: React.FC = () => {
             ctx.strokeStyle = '#ef4444';
             ctx.lineWidth = 2 * uiScale;
             ctx.stroke();
+
+            // Draw Rotation Handle (Top stick)
+            const rotHandleDist = 25 * uiScale;
+            ctx.beginPath();
+            ctx.moveTo(0, -mask.radiusY);
+            ctx.lineTo(0, -mask.radiusY - rotHandleDist);
+            ctx.strokeStyle = '#ef4444';
+            ctx.lineWidth = 2 * uiScale;
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.arc(0, -mask.radiusY - rotHandleDist, handleRadius, 0, Math.PI * 2);
+            ctx.fillStyle = 'white';
+            ctx.fill();
+            ctx.strokeStyle = '#ef4444';
+            ctx.stroke();
+
         } else {
             ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
             ctx.lineWidth = guideLineWidth;
@@ -458,15 +532,40 @@ export const CalendarComposer: React.FC = () => {
       if (activeMaskId) {
         const mask = masks.find(m => m.id === activeMaskId);
         if (mask) {
-          // Resize X handle (Right)
-          if (dist(pos, { x: mask.x + mask.radiusX, y: mask.y }) < hitThreshold) {
+          // 1. Rotation Handle (Calculated in global space)
+          const sin = Math.sin(mask.rotation);
+          const cos = Math.cos(mask.rotation);
+          const rotHandleDist = 25 * uiScale;
+          const rotLocalY = -mask.radiusY - rotHandleDist;
+          // Global coords of rotation handle
+          const rhX = mask.x + (0 * cos - rotLocalY * sin); 
+          const rhY = mask.y + (0 * sin + rotLocalY * cos);
+
+          if (dist(pos, { x: rhX, y: rhY }) < hitThreshold) {
+            setDragMode(DragMode.MASK_ROTATE);
+            setInitialDragMask(mask);
+            setDragStart(pos);
+            return;
+          }
+
+          // 2. Resize X handle (Right, in rotated space? No, simple distance check requires transform if rotated)
+          // To be precise with rotated masks, we transform mouse pos to local space.
+          // Translate Mouse to Mask relative
+          const dx = pos.x - mask.x;
+          const dy = pos.y - mask.y;
+          // Rotate Mouse backwards
+          const localX = dx * cos + dy * sin;
+          const localY = -dx * sin + dy * cos;
+          
+          // Check Resize Width (local: radiusX, 0)
+          if (Math.abs(localX - mask.radiusX) < hitThreshold && Math.abs(localY) < hitThreshold) {
              setDragMode(DragMode.MASK_RESIZE);
              setInitialDragMask(mask);
-             setDragStart(pos);
+             setDragStart(pos); // Keep global drag start for delta calc, but we might change logic in move
              return;
           }
-          // Resize Y handle (Bottom)
-          if (dist(pos, { x: mask.x, y: mask.y + mask.radiusY }) < hitThreshold) {
+          // Check Resize Height (local: 0, radiusY)
+          if (Math.abs(localX) < hitThreshold && Math.abs(localY - mask.radiusY) < hitThreshold) {
              setDragMode(DragMode.MASK_RESIZE); 
              setInitialDragMask(mask);
              setDragStart(pos);
@@ -479,12 +578,17 @@ export const CalendarComposer: React.FC = () => {
       // Reverse order to pick top-most
       for (let i = masks.length - 1; i >= 0; i--) {
         const m = masks[i];
-        // Simple hit test for bounding box of the capsule approx
-        // For precise pill hit test:
-        const dx = Math.abs(pos.x - m.x);
-        const dy = Math.abs(pos.y - m.y);
         
-        if (dx <= m.radiusX && dy <= m.radiusY) {
+        // Transform mouse to local space of mask 'm'
+        const dx = pos.x - m.x;
+        const dy = pos.y - m.y;
+        const cos = Math.cos(-m.rotation); // Rotate backwards
+        const sin = Math.sin(-m.rotation);
+        const localX = dx * cos - dy * sin;
+        const localY = dx * sin + dy * cos;
+
+        // Bounding box hit test in local space
+        if (Math.abs(localX) <= m.radiusX && Math.abs(localY) <= m.radiusY) {
            setActiveMaskId(m.id);
            setDragMode(DragMode.MASK_MOVE);
            setInitialDragMask(m);
@@ -544,25 +648,58 @@ export const CalendarComposer: React.FC = () => {
          return m;
        }));
     }
+    else if (dragMode === DragMode.MASK_ROTATE && initialDragMask && activeMaskId) {
+        setMasks(prev => prev.map(m => {
+          if (m.id === activeMaskId) {
+            // Angle from center to current mouse pos
+            const angle = Math.atan2(pos.y - m.y, pos.x - m.x);
+            // The handle is at -90 deg (Top), so offset by +90 deg
+            return { ...m, rotation: angle + Math.PI / 2 };
+          }
+          return m;
+        }));
+    }
     else if (dragMode === DragMode.MASK_RESIZE && initialDragMask && activeMaskId) {
        setMasks(prev => prev.map(m => {
          if (m.id === activeMaskId) {
             const canvas = canvasRef.current;
             const uiScale = canvas ? Math.max(1, Math.min(canvas.width, canvas.height) / 1000) : 1;
             
-            // Determine which dimension to resize based on initial handle proximity
-            const distToRightHandle = Math.abs(dragStart.x - (initialDragMask.x + initialDragMask.radiusX));
-            const distToBottomHandle = Math.abs(dragStart.y - (initialDragMask.y + initialDragMask.radiusY));
-            const threshold = 50 * uiScale; 
+            // To handle resizing correctly with rotation, we need to project the delta mouse movement onto the local axes.
+            // But a simple distance-based approach is often "good enough" for UI handles if we assume the user drags outwards.
+            // Let's stick to the previous simple logic but be aware it ignores rotation for the drag direction (it works best if rotation is 0).
+            // Improving this: Project drag vector onto local axis.
+            
+            const cos = Math.cos(-initialDragMask.rotation);
+            const sin = Math.sin(-initialDragMask.rotation);
+            // Local Delta
+            const ldx = dx * cos - dy * sin;
+            const ldy = dx * sin + dy * cos;
 
+            // Determine which dimension to resize based on initial handle check logic in mouseDown would be better, 
+            // but here we can infer from which dimension changed significantly relative to handle position?
+            // Actually, `handleMouseDown` set `dragMode` but didn't specify WHICH handle. 
+            // Let's use a simpler heuristic: check initial size.
+            // Or better: Let's assume we are resizing both but clamped? No, that's bad UX.
+            
+            // Let's re-use the "distance to handle" logic from previous version, 
+            // but now we really should have stored WHICH handle was clicked.
+            // For now, let's just use the local delta approach which is robust enough.
+            
+            // We need to know if we clicked the Right handle or Bottom handle.
+            // Simple hack: check dragStart relative to center in local space.
+            const startLocalX = (dragStart.x - initialDragMask.x) * cos - (dragStart.y - initialDragMask.y) * sin;
+            const startLocalY = (dragStart.x - initialDragMask.x) * sin + (dragStart.y - initialDragMask.y) * cos;
+            
             let newRx = m.radiusX;
             let newRy = m.radiusY;
 
-            if (distToRightHandle < threshold) {
-                newRx = Math.max(5 * uiScale, initialDragMask.radiusX + dx);
-            }
-            if (distToBottomHandle < threshold) {
-                newRy = Math.max(5 * uiScale, initialDragMask.radiusY + dy);
+            if (Math.abs(startLocalX) > Math.abs(startLocalY)) {
+                // Width Resize
+                newRx = Math.max(5 * uiScale, initialDragMask.radiusX + ldx);
+            } else {
+                // Height Resize
+                newRy = Math.max(5 * uiScale, initialDragMask.radiusY + ldy);
             }
             
             return { ...m, radiusX: newRx, radiusY: newRy };
@@ -626,8 +763,8 @@ export const CalendarComposer: React.FC = () => {
           <div className="text-sm text-blue-800">
             <p className="font-semibold mb-1">Instructions:</p>
             <ol className="list-decimal list-inside space-y-1">
-                <li>Upload Template (Background)</li>
-                <li>Upload Photo (Foreground)</li>
+                <li>Upload or Paste (Ctrl+V) Template.</li>
+                <li>Upload or Paste Photo.</li>
                 <li>Match corners to the calendar area.</li>
                 <li>Use <strong>Binding Holes</strong> tab to mask out ring binders.</li>
             </ol>
@@ -646,7 +783,7 @@ export const CalendarComposer: React.FC = () => {
                     <label className="flex items-center justify-center w-full h-20 border border-gray-300 border-dashed rounded-lg cursor-pointer bg-white hover:bg-gray-50">
                         <div className="text-center">
                             <Upload className="w-4 h-4 text-gray-400 mx-auto" />
-                            <span className="text-xs text-gray-500">Upload</span>
+                            <span className="text-xs text-gray-500">Upload / Paste</span>
                         </div>
                         <input type="file" className="hidden" accept="image/*" onChange={(e) => handleImageUpload(e, 'bg')} />
                     </label>
@@ -667,7 +804,7 @@ export const CalendarComposer: React.FC = () => {
                     <label className="flex items-center justify-center w-full h-20 border border-gray-300 border-dashed rounded-lg cursor-pointer bg-white hover:bg-gray-50">
                         <div className="text-center">
                             <Upload className="w-4 h-4 text-gray-400 mx-auto" />
-                            <span className="text-xs text-gray-500">Upload</span>
+                            <span className="text-xs text-gray-500">Upload / Paste</span>
                         </div>
                         <input type="file" className="hidden" accept="image/*" onChange={(e) => handleImageUpload(e, 'fg')} />
                     </label>
@@ -774,7 +911,10 @@ export const CalendarComposer: React.FC = () => {
                                     ))}
                                 </div>
                                 <p className="text-[10px] text-gray-400 mt-2">
-                                    Use <strong>Duplicate</strong> for symmetry. <span className="text-red-400 font-bold">Red Dots</span> resize width/height.
+                                    Use <strong>Duplicate</strong> for symmetry. 
+                                    <br/>
+                                    <span className="text-red-400 font-bold">Red Stick</span> to Rotate. 
+                                    <span className="text-red-400 font-bold ml-1">Dots</span> to Resize.
                                 </p>
                             </div>
                         )}
@@ -836,7 +976,7 @@ export const CalendarComposer: React.FC = () => {
                     <CalendarIcon className="w-12 h-12 text-indigo-300 mx-auto mb-3" />
                     <h3 className="text-gray-900 font-semibold text-lg">Waiting for Template</h3>
                     <p className="text-gray-500 text-sm max-w-xs mx-auto mt-1">
-                      Upload "Figure 1" (the calendar base) to start.
+                      Upload "Figure 1" (the calendar base) or press Ctrl+V to start.
                     </p>
                  </div>
               </div>
